@@ -46,3 +46,39 @@ def euler_step(r, target, tau, dt):
     r += dr * dt
     return r
 
+class Recorder: 
+    """A recorder class that logs values over n defined timestep. 
+    
+    Attributes: 
+        record_every: int
+            The timestep at which to record values. Defaults to 10. 
+    """
+    def __init__(self, record_every=10):
+        self.record_every = record_every
+        self.data = []
+        self.step_count = 0
+
+    def record(self, **kwargs):
+        """Records the provided keyword arguments at defined intervals.
+
+        Args:
+            **kwargs: Key-value pairs to record.
+            
+        Usage:
+            recorder.record(r_KC=kc.r, r_MBON=mbon.r, time=t)
+            would record the spiking rates of KCs and MBONs along with the current time.
+        """
+        if self.step_count % self.record_every == 0:
+            self.data.append(kwargs)
+        self.step_count += 1
+
+    def get_arrays(self): 
+        """Converts the recorded data lists into a dictionary of numpy arrays.
+        
+        """
+        return {key: np.array(val) for key, val in self.data.items()}
+    
+    def reset(self):
+        """Resets recorder data clears step count."""
+        self.data = []
+        self.step_count = 0
