@@ -6,4 +6,4 @@ pyyaml
 seaborn
 brian2
 pytest
-h5py
+h5pygi
