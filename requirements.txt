@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+pandas
+pyyaml
+seaborn
+brian2
+pytest
+h5py
