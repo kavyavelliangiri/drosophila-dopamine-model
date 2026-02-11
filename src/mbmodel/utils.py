@@ -10,10 +10,10 @@ def relu(x, max_val = None):
     Returns:
         The result of applying the ReLU function to the input.
     """
-    result = max(0, x)
+    output = np.maximum(0, x)  # ✅ np.maximum works with arrays
     if max_val is not None:
-        result = min(result, max_val)
-    return result
+        output = np.minimum(output, max_val)  # ✅ np.minimum works with arrays
+    return output
 
 def sigmoid(x, theta=0.0, gain=1.0):
     """Computes the sigmoid activation function.
@@ -55,7 +55,7 @@ class Recorder:
     """
     def __init__(self, record_every=10):
         self.record_every = record_every
-        self.data = []
+        self.data = {}
         self.step_count = 0
 
     def record(self, **kwargs):
@@ -69,7 +69,14 @@ class Recorder:
             would record the spiking rates of KCs and MBONs along with the current time.
         """
         if self.step_count % self.record_every == 0:
-            self.data.append(kwargs)
+            for key, value in kwargs.items():
+                if key not in self.data:
+                    self.data[key] = []  # Create a list for this variable
+                # Copy arrays to avoid reference issues
+                if isinstance(value, np.ndarray):
+                    self.data[key].append(value.copy())
+                else:
+                    self.data[key].append(value)
         self.step_count += 1
 
     def get_arrays(self): 
