@@ -61,4 +61,98 @@ class NeuronPopulation:
     def __repr__(self):
         return f"<{self.name} mean rate: {np.mean(self.r):.2f} Hz>"
     
+class MushroomBodyNetwork:
+    """Full mushroom body circuit.
+    
+    Parameters
+    ----------
+    config : dict
+        Configuration with network parameters
+    """
+    
+    def __init__(self, config):
+        from mbmodel.connectivity import load_flywire_connectivity, create_random_sparse
+        from mbmodel.plasticity import DopaminePlasticity
+        
+        # Extract config
+        self.config = config
+        self.dt = config.get('dt', 0.1)
+        
+        # Create populations
+        self.KCs = NeuronPopulation(
+            n=config['n_KCs'],
+            tau=config.get('tau_KC', 10.0),
+            r_max=config.get('r_max_KC', 100.0),
+            name="KCs"
+        )
+        
+        self.MBONs = NeuronPopulation(
+            n=config['n_MBONs'],
+            tau=config.get('tau_MBON', 20.0),
+            r_max=config.get('r_max_MBON', 100.0),
+            name="MBONs"
+        )
+        
+        self.DANs = NeuronPopulation(
+            n=config['n_DANs'],
+            tau=config.get('tau_DAN', 15.0),
+            r_max=config.get('r_max_DAN', 100.0),
+            name="DANs"
+        )
+        
+        # Load connectivity
+        if 'connectome_path' in config:
+            self.W_KC_MBON, _ = load_flywire_connectivity(
+                config['connectome_path'])
+        else:
+            self.W_KC_MBON = create_random_sparse(
+                config['n_KCs'], config['n_MBONs'], sparsity=0.1)
+        
+        # Store initial weights
+        self.W_initial = self.W_KC_MBON.copy()
+        
+        # Plasticity
+        self.plasticity = DopaminePlasticity(
+            learning_rate=config.get('learning_rate', 0.001),
+            DA_baseline=config.get('DA_baseline', 20.0),
+            tau_DA=config.get('tau_DA', 500.0)
+        )
+    
+    def step(self, I_KC, I_DAN):
+        """Run one timestep.
+        
+        Parameters
+        ----------
+        I_KC : ndarray, shape (n_KCs,)
+        I_DAN : ndarray, shape (n_DANs,)
+        """
+        # Update neurons
+        self.KCs.update(I_KC, self.dt)
+        
+        I_MBON = self.W_KC_MBON @ self.KCs.r
+        self.MBONs.update(I_MBON, self.dt)
+        
+        self.DANs.update(I_DAN, self.dt)
+        
+        # Update plasticity
+        self.plasticity.update_DA(self.DANs.r, self.dt)
+        self.W_KC_MBON = self.plasticity.update_weights(
+            self.W_KC_MBON, self.KCs.r, self.MBONs.r, self.dt)
+    
+    def reset_activity(self):
+        """Reset firing rates, keep weights."""
+        self.KCs.reset()
+        self.MBONs.reset()
+        self.DANs.reset()
+        self.plasticity.reset()
+    
+    def reset_weights(self):
+        """Reset to initial weights."""
+        self.W_KC_MBON = self.W_initial.copy()
+    
+    def get_weight_change(self):
+        """Compute weight change from initial."""
+        return self.W_KC_MBON - self.W_initial
+
+    
     
