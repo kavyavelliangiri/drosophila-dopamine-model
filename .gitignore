@@ -1,3 +1,14 @@
+# OS files
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Miscellaneous
+*.docx
+*.txt
+!requirements.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

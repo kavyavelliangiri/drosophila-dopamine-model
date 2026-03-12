@@ -1,232 +1,219 @@
 __author__ = "Kavya Velliangiri"
 __credits__ = ["Kavya Velliangiri"]
 __license__ = "MIT"
-__version__ = "v2"
+__version__ = "v3"
 __maintainer__ = "Kavya Velliangiri"
 
-"""A module that implements a dopaminergic plasticity rule for the KC>MBON synapses based on the activity of the DANs:
-Implements the detailed plasticity rule from Gkanias et al. with:
-- Dopamine receptor signaling
-- ER-cAMP concentration dynamics
-- Ca2+ concentration dynamics
-- Three-factor weight update rule
+"""Dopaminergic plasticity rules for KC->MBON synapses.
+
+Two implementations:
+  - GkaniasDPR : Dopaminergic Plasticity Rule from Gkanias et al. (2022) with
+                 fast (D_△) and slow (D_▽) DA components.
+  - DopaminePlasticity : simplified single-DA scalar rule (original v1).
+
+Reference equations (thesis eqs 5-7, based on Gkanias et al., 2022):
+
+  Fast DA component (eq. D_△, DopR1/cAMP pathway):
+    τ_short · dD_△/dt = d(t) - D_△        [fast DA tracker, τ = 200 ms]
+
+  Slow DA component (eq. D_▽, DopR2/ER-Ca²⁺ pathway):
+    τ_long  · dD_▽/dt = d(t) - D_▽        [slow DA tracker, τ = 2000 ms]
+
+  Dopaminergic factor (thesis eq 7):
+    δ_j(t) = D_▽_j(t) - D_△_j(t)          [slow minus fast]
+
+  Weight update rule (DPR, thesis eq 8):
+    dW_ij/dt = η · δ_j(t) · [k_i(t) + W_ij(t) - w_rest]
+
+The sign convention δ = D_▽ − D_△ (slow minus fast) ensures that
+coincidence of KC activity with a fast DA transient drives depression
+(δ < 0), matching Handler et al. (2019) forward-conditioning results.
+
+where d_j(t) is the dopamine signal at MBON j's compartment, k_i(t) is KC i
+activity, W_ij(t) is the KC_i -> MBON_j synaptic weight, and w_rest is the
+resting/baseline weight.
 """
 
 import numpy as np
 from mbmodel.utils import euler_step
 
 
-"""Dopamine-modulated plasticity with cAMP and Ca2+ dynamics.
+class GkaniasDPR:
+    """Dopaminergic Plasticity Rule (Gkanias et al., 2022).
 
-FIXED VERSION with proper biological signaling.
-"""
+    Models synaptic plasticity at KC->MBON synapses via two dopamine
+    components that track the DA signal at different timescales:
 
-import numpy as np
-from mbmodel.utils import euler_step
+      Fast DA component D_△ (DopR1/cAMP, τ_short):
+        τ_short · dD_△_j/dt = d_j(t) - D_△_j
 
+      Slow DA component D_▽ (DopR2/ER-Ca²⁺, τ_long):
+        τ_long · dD_▽_j/dt = d_j(t) - D_▽_j
 
-class BiologicalPlasticity:
-    """Biologically detailed dopamine-modulated plasticity.
-    
-    Implements the weight update rule:
-    ΔW_k2m(t) = δ(t)[κ^i(t) + W_k2m(t) - w_rest]
-    
+      Dopaminergic factor (thesis eq 7):
+        δ_j(t) = D_▽_j(t) - D_△_j(t)       [slow minus fast]
+
+      Weight update (DPR):
+        dW_ij/dt = η · δ_j(t) · [k_i(t) + W_ij(t) - w_rest]
+
+    The sign of δ determines depression (δ < 0) or potentiation (δ > 0).
+    During DA onset, D_△ (fast) rises before D_▽ (slow) → δ < 0 → depression.
+    After DA offset, D_△ decays first, D_▽ lingers → δ > 0 → potentiation.
+
     Parameters
     ----------
     learning_rate : float
-        Global learning rate (default: 0.002, increased from 0.001)
+        Global learning rate η (default: 0.01)
     w_rest : float
-        Resting weight value (default: 1.0)
-    tau_eligibility : float
-        Eligibility trace decay time constant in ms (default: 1000)
-    tau_cAMP : float
-        cAMP dynamics time constant in ms (default: 500)
-    tau_Ca : float
-        Ca2+ dynamics time constant in ms (default: 200)
-    DA_baseline : float
-        Baseline dopamine level (default: 20.0 Hz)
-    cAMP_baseline : float
-        Baseline cAMP concentration (default: 0.5)
-    Ca_baseline : float
-        Baseline Ca2+ concentration (default: 0.1)
-    kappa_scale : float
-        Scaling factor for kappa (default: 10.0)
-    w_min : float
-        Minimum weight value (default: 0.0)
-    w_max : float
-        Maximum weight value (default: 10.0)
+        Resting synaptic weight w_rest (default: 1.0)
+    tau_short : float
+        Fast DA filter time constant τ_short in ms (default: 200.0)
+    tau_long : float
+        Slow DA filter time constant τ_long in ms (default: 2000.0)
+    w_min, w_max : float
+        Weight bounds
     """
-    
-    def __init__(self, 
-                 learning_rate=0.002,  # Increased slightly
-                 w_rest=1.0,
-                 tau_eligibility=1000.0,
-                 tau_cAMP=500.0,
-                 tau_Ca=200.0,
-                 DA_baseline=20.0,
-                 cAMP_baseline=0.5,
-                 Ca_baseline=0.1,
-                 kappa_scale=10.0,  # NEW: scale kappa appropriately
-                 w_min=0.0,
-                 w_max=10.0):
-        
-        # Learning parameters
+
+    def __init__(
+        self,
+        learning_rate=0.01,
+        w_rest=1.0,
+        tau_short=200.0,
+        tau_long=2000.0,
+        w_min=0.0,
+        w_max=10.0,
+        kc_gating_only=False,
+    ):
         self.learning_rate = learning_rate
         self.w_rest = w_rest
-        self.kappa_scale = kappa_scale
-        
-        # Time constants
-        self.tau_eligibility = tau_eligibility
-        self.tau_cAMP = tau_cAMP
-        self.tau_Ca = tau_Ca
-        
-        # Baseline concentrations
-        self.DA_baseline = DA_baseline
-        self.cAMP_baseline = cAMP_baseline
-        self.Ca_baseline = Ca_baseline
-        
-        # Weight bounds
+        self.tau_short = tau_short
+        self.tau_long = tau_long
         self.w_min = w_min
         self.w_max = w_max
-        
-        # State variables
-        self.eligibility = None
-        self.cAMP = cAMP_baseline
-        self.Ca = Ca_baseline
-        self.DA = DA_baseline
-        
-    def update_DA(self, r_DAN, dt):
-        """Update dopamine concentration from DAN activity."""
-        r_mean = np.mean(r_DAN) if isinstance(r_DAN, np.ndarray) else r_DAN
-        tau_DA = 100.0  # Fast DA clearance
-        self.DA = euler_step(self.DA, r_mean, tau_DA, dt)
-    
-    def update_cAMP(self, dt):
-        """Update cAMP concentration based on dopamine.
-        
-        FIXED: cAMP should INCREASE with positive DA signal for LTP.
-        """
-        # Dopamine signal (deviation from baseline)
-        DA_signal = self.DA - self.DA_baseline
-        
-        # cAMP production is RECTIFIED - only increases with positive DA
-        # This prevents negative kappa during the odor presentation
-        if DA_signal > 0:
-            # Positive DA -> increase cAMP above baseline
-            cAMP_target = self.cAMP_baseline + 0.5 * DA_signal  # Increased gain
-        else:
-            # Negative DA -> return to baseline (but don't go below)
-            cAMP_target = self.cAMP_baseline
-        
-        cAMP_target = np.clip(cAMP_target, self.cAMP_baseline, 3.0)
-        
-        # Update cAMP
-        self.cAMP = euler_step(self.cAMP, cAMP_target, self.tau_cAMP, dt)
-    
-    def update_Ca(self, r_post, dt):
-        """Update Ca2+ concentration based on postsynaptic activity."""
-        mean_post_rate = np.mean(r_post)
-        
-        # Ca2+ influx during MBON activity
-        Ca_target = self.Ca_baseline + 0.02 * mean_post_rate  # Increased gain
-        Ca_target = np.clip(Ca_target, 0, 2.0)
-        
-        # Fast Ca2+ dynamics
-        self.Ca = euler_step(self.Ca, Ca_target, self.tau_Ca, dt)
-    
-    def update_eligibility(self, r_pre, dt):
-        """Update eligibility traces for each synapse."""
-        if self.eligibility is None:
-            self.eligibility = np.zeros_like(r_pre)
-        
-        # Eligibility increases with presynaptic activity
-        target = r_pre / 100.0
-        self.eligibility = euler_step(
-            self.eligibility, target, self.tau_eligibility, dt
-        )
-        
-        return self.eligibility
-    
-    def compute_kappa(self):
-        """Compute intracellular signaling term κ^i(t).
-        
-        FIXED: Use multiplicative interaction that's always positive
-        when both signals are elevated.
-        
+        self.kc_gating_only = kc_gating_only
+
+        # State variables, initialized lazily on first update
+        self.D_up = None    # D_△ (fast, τ_short, DopR1/cAMP), shape (n_mbon,)
+        self.D_down = None  # D_▽ (slow, τ_long, DopR2/ER-Ca²⁺), shape (n_mbon,)
+        self._buf = None    # reusable (n_mbon, n_kc) work buffer; avoids ~5MB alloc/step
+
+    # ------------------------------------------------------------------
+    # DA signal update
+    # ------------------------------------------------------------------
+
+    def update(self, da_per_mbon, kc_rates, W, dt):
+        """Update D_△, D_▽ and synaptic weights for one timestep.
+
+        Parameters
+        ----------
+        da_per_mbon : ndarray, shape (n_mbon,)
+            Dopamine input to each MBON: W_DAN_MBON @ DANs.r
+        kc_rates : ndarray, shape (n_kc,)
+            KC firing rates k_i(t)
+        W : ndarray, shape (n_mbon, n_kc)
+            Current KC->MBON weight matrix
+        dt : float
+            Timestep in ms
+
         Returns
         -------
-        kappa : float
-            Intracellular signaling strength
+        W : ndarray, shape (n_mbon, n_kc)
+            Updated weight matrix
         """
-        # Normalized deviations from baseline
-        cAMP_norm = (self.cAMP - self.cAMP_baseline) / self.cAMP_baseline
-        Ca_norm = (self.Ca - self.Ca_baseline) / self.Ca_baseline
-        
-        # Multiplicative interaction (Hebbian-like)
-        # Both must be elevated for strong potentiation
-        kappa = self.kappa_scale * cAMP_norm * Ca_norm
-        
-        return kappa
-    
-    def update_weights(self, W, r_pre, r_post, dt):
-        """Update synaptic weights using biological plasticity rule.
-        
-        Implements: ΔW_k2m(t) = η * δ(t)[κ^i(t) + W_k2m(t) - w_rest]
-        """
-        # Update all biological variables
-        eligibility = self.update_eligibility(r_pre, dt)
-        kappa = self.compute_kappa()
-        
-        # Broadcast eligibility across MBONs
-        delta = eligibility[np.newaxis, :]  # Shape: (1, n_pre)
-        
-        # Weight update with homeostatic term
-        plasticity_term = kappa + W - self.w_rest
-        
-        # Weight change
-        dW = self.learning_rate * delta * plasticity_term * dt
-        
-        # Apply weight change
-        W = W + dW
-        
-        # Enforce bounds
-        W = np.clip(W, self.w_min, self.w_max)
-        
-        return W
-    
-    def reset(self):
-        """Reset all state variables to baseline."""
-        self.DA = self.DA_baseline
-        self.cAMP = self.cAMP_baseline
-        self.Ca = self.Ca_baseline
-        self.eligibility = None
+        # Lazy initialization
+        if self.D_up is None:
+            self.D_up   = np.zeros_like(da_per_mbon)
+            self.D_down = np.zeros_like(da_per_mbon)
+        if self._buf is None:
+            self._buf = np.empty_like(W)
 
+        # τ_short · dD_△/dt = d - D_△
+        self.D_up = euler_step(self.D_up, da_per_mbon, self.tau_short, dt)
+
+        # τ_long · dD_▽/dt = d - D_▽
+        self.D_down = euler_step(self.D_down, da_per_mbon, self.tau_long, dt)
+
+        # Dopaminergic factor: δ_j = D_▽_j - D_△_j  (thesis eq 7)
+        # D_▽ (slow, τ_long) minus D_△ (fast, τ_short).
+        # During DA onset, D_△ rises faster → δ < 0 → depression.
+        # After DA offset, D_△ decays faster, D_▽ lingers → δ > 0 → potentiation.
+        # Matches Handler et al. (2019): DopR1 (fast) drives acquisition/depression.
+        delta = self.D_down - self.D_up  # (n_mbon,)
+
+        # DPR weight update (in-place to avoid ~5 MB of temporaries per step):
+        if self.kc_gating_only:
+            # MV-compatible form (Bennett et al. 2021): dW_ij = η · dt · δ_j · k_i
+            # Uses only KC activity for gating — stable for bidirectional
+            # plasticity (no runaway from W-dependent positive feedback).
+            np.copyto(self._buf, kc_rates[np.newaxis, :])        # buf = k
+        else:
+            # Original Gkanias DPR: dW_ij = η · dt · δ_j · [k_i + W_ij − w_rest]
+            np.add(kc_rates[np.newaxis, :], W, out=self._buf)    # buf = k + W
+            self._buf -= self.w_rest                               # buf = k + W - w_rest
+        self._buf *= (self.learning_rate * dt) * delta[:, np.newaxis]  # buf = dW
+        W += self._buf                                        # W updated in-place
+        np.clip(W, self.w_min, self.w_max, out=W)
+        return W
+
+    @property
+    def delta(self):
+        """Current dopaminergic factor δ = D_▽ - D_△ (thesis eq 7)."""
+        if self.D_up is None:
+            return None
+        return self.D_down - self.D_up
+
+    def reset(self):
+        """Reset DA state to zero (keep buffers allocated for reuse)."""
+        if self.D_up is not None:
+            self.D_up[:]   = 0.0
+            self.D_down[:] = 0.0
+        # _buf intentionally kept; W shape is constant across trials
+
+
+# ---------------------------------------------------------------------------
+# Simple baseline rule (v1 -- kept for reference)
+# ---------------------------------------------------------------------------
 
 class DopaminePlasticity:
-    """Simple dopamine-modulated plasticity (original version)."""
-    
-    def __init__(self, learning_rate=0.001, DA_baseline=20.0,
-                 tau_DA=500.0, w_min=0.0, w_max=10.0):
+    """Simple dopamine-modulated anti-Hebbian plasticity.
+
+    Single scalar DA signal; weight update:
+        dW/dt = η · (DA - DA_baseline) · k_i · r_j
+
+    Parameters
+    ----------
+    learning_rate : float
+    DA_baseline : float
+        Tonic DA level (Hz)
+    tau_DA : float
+        DA clearance time constant (ms)
+    w_min, w_max : float
+    """
+
+    def __init__(
+        self,
+        learning_rate=0.001,
+        DA_baseline=20.0,
+        tau_DA=500.0,
+        w_min=0.0,
+        w_max=10.0,
+    ):
         self.eta = learning_rate
         self.DA_baseline = DA_baseline
         self.tau_DA = tau_DA
         self.w_min = w_min
         self.w_max = w_max
         self.DA = DA_baseline
-    
+
     def update_DA(self, r_DAN, dt):
-        """Update dopamine concentration."""
         r_mean = np.mean(r_DAN) if isinstance(r_DAN, np.ndarray) else r_DAN
         self.DA = euler_step(self.DA, r_mean, self.tau_DA, dt)
-    
+
     def update_weights(self, W, r_pre, r_post, dt):
-        """Update synaptic weights (simple rule)."""
         DA_signal = self.DA - self.DA_baseline
         dW = self.eta * np.outer(r_post, r_pre) * DA_signal * dt
-        W = W + dW
-        W = np.clip(W, self.w_min, self.w_max)
+        W = np.clip(W + dW, self.w_min, self.w_max)
         return W
-    
+
     def reset(self):
-        """Reset dopamine to baseline."""
         self.DA = self.DA_baseline

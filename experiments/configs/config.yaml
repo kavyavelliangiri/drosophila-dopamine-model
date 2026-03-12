@@ -1,0 +1,28 @@
+# Full model configuration
+
+# Network size
+# n_KCs: 2597
+# n_MBONs: 48
+# n_DANs: 165
+
+# Neuron parameters
+tau_KC: 10.0
+tau_MBON: 20.0
+tau_DAN: 15.0
+r_max_KC: 100.0
+r_max_MBON: 100.0
+r_max_DAN: 100.0
+
+# Plasticity (Gkanias et al., 2022 DPR)
+learning_rate: 0.01      # eta: global learning rate
+w_rest: 1.0              # resting KC->MBON synaptic weight
+tau_short: 200.0         # fast DA filter time constant (ms) -- D_△ potentiation
+tau_long: 2000.0         # slow DA filter time constant (ms) -- D_▽ depression
+w_punish: 1.0            # punishment signal weight to DANs
+
+# Simulation
+dt: 0.1
+
+# Data (optional - uses random if not specified)
+connectome_path: 'data/connectomes/processed/mb_circuit_right_weights.npz'
+ids_path: 'data/connectomes/processed/mb_circuit_right_ids.npz'

@@ -1,25 +1,36 @@
 """Load and process connectome data from FlyWire."""
 import numpy as np
 import pandas as pd
-from fafbseg import flywire
-from fafbseg.flywire import NeuronCriteria as NC
+
+# fafbseg is only needed for live FlyWire queries, not for loading
+# cached .npz / .csv data.  Import lazily to avoid hard dependency.
+flywire = None
+NC = None
+
+def _ensure_flywire():
+    global flywire, NC
+    if flywire is None:
+        from fafbseg import flywire as _fw
+        from fafbseg.flywire import NeuronCriteria as _NC
+        flywire = _fw
+        NC = _NC
 
 
 def setup_flywire(dataset='public'):
     """Set up FlyWire connection.
-    
+
     Parameters
     ----------
     dataset : str
         'public' for public release (recommended), 'production' if you have access
-    
+
     Notes
     -----
     Requires authentication token. Run once:
         flywire.set_chunkedgraph_secret("your_token_here")
     Get token from: https://global.daf-apis.com/auth/api/v1/user/token
     """
-    # flywire.set_chunkedgraph_secret("155ef81790925555205104cb480cf567")
+    _ensure_flywire()
     flywire.set_default_dataset(dataset)
 
 
@@ -42,6 +53,7 @@ def fetch_kc_mbon_ids(side=None):
     mbon_ann : DataFrame
         Full MBON annotations
     """
+    _ensure_flywire()
     # Search by cell_class for KCs and MBONs
     # KCs are class "Kenyon_cell" or you can search by type pattern
     if side:
@@ -85,6 +97,7 @@ def fetch_kc_mbon_connectivity(kc_ids=None, mbon_ids=None,
     metadata : dict
         Contains kc_ids, mbon_ids, kc_types, mbon_types
     """
+    _ensure_flywire()
     # Fetch IDs if not provided
     if kc_ids is None or mbon_ids is None:
         kc_ids, mbon_ids, kc_ann, mbon_ann = fetch_kc_mbon_ids()
@@ -164,6 +177,7 @@ def fetch_dan_connectivity(mbon_ids=None, proofread_only=True):
     dan_ann : DataFrame
         DAN annotations
     """
+    _ensure_flywire()
     # Get DANs (PPL1 and PAM clusters)
     dan_ann = flywire.search_annotations('cell_class:DAN')
     dan_ids = dan_ann['root_id'].tolist()
@@ -329,6 +343,7 @@ def fetch_full_mb_connectivity(side=None, proofread_only=True, min_weight=1):
     ids : dict
         Dictionary with 'kc', 'mbon', 'dan' ID lists
     """
+    _ensure_flywire()
     # Fetch all neuron IDs
     print("Fetching neuron annotations...")
     
@@ -533,22 +548,238 @@ def save_full_connectivity(connectivity, annotations, ids, prefix='mb_circuit'):
     
     print(f"Saved to {prefix}_*.csv and {prefix}_*.npz")
 
+def create_random_sparse(n_pre, n_post, sparsity=0.1, w_mean=1.0):
+    """Create random sparse connectivity (for testing).
+    
+    Useful before you have real connectome data.
+    
+    Parameters
+    ----------
+    n_pre, n_post : int
+        Number of pre and postsynaptic neurons
+    sparsity : float
+        Fraction of possible connections (0-1)
+    w_mean : float
+        Mean weight
+    
+    Returns
+    -------
+    W : ndarray, shape (n_post, n_pre)
+    """
+    n_connections = int(n_pre * n_post * sparsity)
+    W = np.zeros((n_post, n_pre))
+    
+    # Random connection indices
+    connections = np.random.choice(n_pre * n_post, n_connections, 
+                                  replace=False)
+    
+    for conn in connections:
+        i = conn // n_pre
+        j = conn % n_pre
+        W[i, j] = np.random.exponential(w_mean)
+    
+    return W
+
+# =====================================================================
+# PN (projection neuron) connectivity — for odor pipeline (v4f)
+# =====================================================================
+
+def fetch_pn_ids(glomeruli, side='right'):
+    """Fetch root IDs for olfactory PNs innervating specific glomeruli.
+
+    Uses fafbseg ``search_annotations`` with ``NeuronCriteria(hemibrain_type=...)``
+    to find projection neurons for each glomerulus.  PN hemibrain_types follow
+    the pattern ``{glomerulus}_{type}PN`` (e.g. ``DC1_adPN``, ``DM2_lPN``).
+
+    Parameters
+    ----------
+    glomeruli : list of str
+        Glomerulus names to search for (e.g. ``['DC1', 'DL5', 'DM2']``).
+    side : str
+        Hemisphere: ``'right'`` or ``'left'``.
+
+    Returns
+    -------
+    pn_ids : list of int
+        Root IDs of matched PNs.
+    pn_ann : DataFrame
+        Annotations with columns ``root_id``, ``hemibrain_type``, ``glomerulus``.
+    """
+    _ensure_flywire()
+    import re
+
+    pn_subtypes = ['adPN', 'lPN', 'lvPN', 'vPN', 'l2PN', 'lv2PN']
+    all_rows = []
+
+    for glom in glomeruli:
+        found = False
+        for pt in pn_subtypes:
+            htype = f'{glom}_{pt}'
+            try:
+                ann = flywire.search_annotations(NC(hemibrain_type=htype, side=side))
+                if len(ann) > 0:
+                    for _, row in ann.iterrows():
+                        all_rows.append({
+                            'root_id': row['root_id'],
+                            'hemibrain_type': row['hemibrain_type'],
+                            'glomerulus': glom,
+                        })
+                    found = True
+            except Exception:
+                pass
+        # Fallback: regex search for glomerulus in hemibrain_type
+        if not found:
+            try:
+                ann = flywire.search_annotations(
+                    f'hemibrain_type:{glom}', regex=True)
+                ann = ann[ann['side'] == side]
+                ann = ann[ann['cell_class'].isin(['ALPN', 'PN', 'uPN'])]
+                if len(ann) > 0:
+                    for _, row in ann.iterrows():
+                        # Parse glomerulus from hemibrain_type
+                        m = re.match(r'^([A-Z][A-Z0-9a-z]+?)(?:l|m)?_',
+                                     str(row['hemibrain_type']))
+                        g = m.group(1) if m else glom
+                        all_rows.append({
+                            'root_id': row['root_id'],
+                            'hemibrain_type': row['hemibrain_type'],
+                            'glomerulus': g,
+                        })
+                    found = True
+            except Exception:
+                pass
+        status = f"{sum(1 for r in all_rows if r['glomerulus'] == glom)} PNs" if found else "NONE"
+        print(f"  {glom}: {status}")
+
+    pn_ann = pd.DataFrame(all_rows)
+    pn_ids = pn_ann['root_id'].tolist()
+    print(f"Total: {len(pn_ids)} PNs across {len(glomeruli)} glomeruli")
+    return pn_ids, pn_ann
+
+
+def fetch_pn_to_kc_connectivity(pn_ids, kc_ids):
+    """Fetch PN→KC connectivity using ``flywire.get_connectivity``.
+
+    Same pattern as ``fetch_kc_mbon_connectivity``: get PN downstream
+    connections, filter to KCs, build weight matrix.
+
+    Parameters
+    ----------
+    pn_ids : list of int
+        PN root IDs (presynaptic).
+    kc_ids : array-like of int
+        KC root IDs (postsynaptic).
+
+    Returns
+    -------
+    W_PN_KC : ndarray, shape (n_kc, n_pn)
+        Weight matrix (synapse counts).  Convention: ``W[post, pre]``.
+    edge_df : DataFrame
+        Edge list with columns ``pre``, ``post``, ``weight``.
+    """
+    _ensure_flywire()
+
+    kc_set = set(int(x) for x in kc_ids)
+
+    print(f"Fetching downstream connectivity for {len(pn_ids)} PNs ...")
+    conn = flywire.get_connectivity(
+        pn_ids, upstream=False, downstream=True, proofread_only=True,
+    )
+
+    # Filter to KC targets
+    pn_to_kc = conn[conn['post'].isin(kc_set)].copy()
+    print(f"  {len(pn_to_kc)} PN→KC connections "
+          f"({pn_to_kc['pre'].nunique()} PNs → {pn_to_kc['post'].nunique()} KCs)")
+
+    # Build weight matrix (n_kc × n_pn)
+    pn_idx = {int(pid): j for j, pid in enumerate(pn_ids)}
+    kc_list = [int(x) for x in kc_ids]
+    kc_idx = {kid: i for i, kid in enumerate(kc_list)}
+
+    n_pn = len(pn_ids)
+    n_kc = len(kc_list)
+    W = np.zeros((n_kc, n_pn))
+    for _, row in pn_to_kc.iterrows():
+        pre = int(row['pre'])
+        post = int(row['post'])
+        if pre in pn_idx and post in kc_idx:
+            W[kc_idx[post], pn_idx[pre]] = row['weight']
+
+    print(f"  W_PN_KC shape: {W.shape}, nnz: {np.count_nonzero(W)}")
+    return W, pn_to_kc
+
+
+def fetch_and_cache_pn_kc(glomeruli, data_dir='data/connectomes/processed',
+                          side='right'):
+    """Fetch PN→KC connectivity for given glomeruli and save to cache files.
+
+    Uses fafbseg to search for PNs by ``hemibrain_type`` and
+    ``flywire.get_connectivity`` for downstream connections.
+
+    Creates:
+      - ``{data_dir}/mb_circuit_right_pn_to_kc.csv``  (edge list)
+      - ``{data_dir}/mb_circuit_right_pn_annotations.csv``
+      - ``{data_dir}/mb_circuit_right_pn_to_kc_weights.npz``
+
+    Parameters
+    ----------
+    glomeruli : list of str
+        Glomerulus names (e.g. ``['DC1', 'DL5', 'DM2']``).
+    data_dir : str
+        Output directory for cached files.
+    side : str
+        Hemisphere.
+    """
+    import os
+
+    setup_flywire('public')
+
+    ids_path = os.path.join(data_dir, 'mb_circuit_right_ids.npz')
+    ids_data = np.load(ids_path, allow_pickle=True)
+    kc_ids = ids_data['kc_ids']
+
+    print("Fetching PN IDs and annotations ...")
+    pn_ids, pn_ann = fetch_pn_ids(glomeruli, side=side)
+
+    print("Fetching PN→KC connectivity ...")
+    W_PN_KC, edge_df = fetch_pn_to_kc_connectivity(pn_ids, kc_ids)
+
+    # Save
+    edge_path = os.path.join(data_dir, 'mb_circuit_right_pn_to_kc.csv')
+    ann_path = os.path.join(data_dir, 'mb_circuit_right_pn_annotations.csv')
+    npz_path = os.path.join(data_dir, 'mb_circuit_right_pn_to_kc_weights.npz')
+
+    edge_df.to_csv(edge_path, index=False)
+    pn_ann.to_csv(ann_path, index=False)
+    np.savez(npz_path, weights=W_PN_KC, pn_ids=np.array(pn_ids))
+
+    print(f"Saved: {edge_path}")
+    print(f"Saved: {ann_path}")
+    print(f"Saved: {npz_path}")
+
+    return W_PN_KC, pn_ann
+
 
 # Example usage
 if __name__ == '__main__':
-    setup_flywire('public')
-    
-    # Fetch everything
-    conn, ann, ids = fetch_full_mb_connectivity(side='right')
-    
-    # Build matrices
-    W = build_weight_matrices(conn, ids)
-    
-    print(f"\nMatrix shapes:")
-    for name, mat in W.items():
-        print(f"  {name}: {mat.shape}, nnz={np.count_nonzero(mat)}")
-    
-    # Save for later
-    save_full_connectivity(conn, ann, ids, prefix='mb_circuit_right')
+    import sys
+
+    if '--fetch-pn' in sys.argv:
+        fetch_and_cache_pn_kc()
+    else:
+        setup_flywire('public')
+
+        # Fetch everything
+        conn, ann, ids = fetch_full_mb_connectivity(side='right')
+
+        # Build matrices
+        W = build_weight_matrices(conn, ids)
+
+        print(f"\nMatrix shapes:")
+        for name, mat in W.items():
+            print(f"  {name}: {mat.shape}, nnz={np.count_nonzero(mat)}")
+
+        # Save for later
+        save_full_connectivity(conn, ann, ids, prefix='mb_circuit_right')
 
     
