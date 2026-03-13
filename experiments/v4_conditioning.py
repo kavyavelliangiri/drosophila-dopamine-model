@@ -4,13 +4,14 @@ Emulates the paradigm from Gkanias et al. (2022) eLife 75611 §4:
 
   Forward  conditioning: CS (odor) on for T_cs ms; US (PPL shock) overlaps
                          the final T_us ms of CS.  US arrives WHILE KCs are
-                         still active → δ = D_△ − D_▽ > 0 during KC activity
-                         → net KC→MBON potentiation.
+                         still active → D_△ (fast) rises before D_▽ (slow)
+                         → δ = D_▽ − D_△ < 0 during KC activity
+                         → net KC→MBON depression.
 
   Backward conditioning: US delivered first (T_us ms); CS begins T_isi ms
                          after US ends.  When KCs activate, D_△ (τ_short=200ms)
                          has largely decayed but D_▽ (τ_long=2000ms) remains
-                         elevated → δ < 0 → net KC→MBON depression.
+                         elevated → δ = D_▽ − D_△ > 0 → net KC→MBON potentiation.
 
 Trial structure (following Gkanias et al. single-phase example):
   Phase 1  blank        : 0 – t_blank
@@ -83,10 +84,130 @@ def classify_mbons():
     return {'approach': approach, 'avoid': avoid, 'other': other}
 
 
+def build_mbon_sign_mask(n_mbon, mbon_groups):
+    """Build sign mask from manual classification: +1 approach, -1 avoid, 0 other.
+
+    Reference: Aso et al. (2014b) / Aso & Rubin (2016).
+    """
+    mask = np.zeros(n_mbon)
+    mask[mbon_groups['approach']] = +1.0
+    mask[mbon_groups['avoid']]   = -1.0
+    return mask
+
+
+def derive_mbon_sign_from_connectivity(W_DAN_MBON, ppl_indices, pam_indices,
+                                        mode='hard'):
+    """Derive MBON valence sign mask from DAN→MBON connectivity.
+
+    For each MBON j, computes the fraction of dopaminergic input from PPL
+    (aversive) vs PAM (appetitive) DANs.  MBONs receiving primarily PPL input
+    are classified as approach (PPL1 innervates approach compartments per
+    Aso et al. 2014b), and those receiving primarily PAM input as avoid.
+
+    Parameters
+    ----------
+    W_DAN_MBON : ndarray, shape (n_mbon, n_dan)
+        DAN→MBON connectivity matrix (row = postsynaptic MBON).
+    ppl_indices : list of int
+        Column indices of PPL (aversive) DANs.
+    pam_indices : list of int
+        Column indices of PAM (appetitive) DANs.
+    mode : str
+        'hard'       — binary sign: +1 if ppl_fraction > 0.5, −1 if < 0.5, 0 if equal/no input
+        'continuous' — smooth sign: 2 × ppl_fraction − 1 (ranges from −1 to +1)
+
+    Returns
+    -------
+    sign_mask : ndarray, shape (n_mbon,)
+        +1 for approach (PPL-dominated), −1 for avoid (PAM-dominated).
+    ppl_fractions : ndarray, shape (n_mbon,)
+        PPL fraction for each MBON (useful for analysis).
+    """
+    n_mbon = W_DAN_MBON.shape[0]
+    ppl_input = W_DAN_MBON[:, ppl_indices].sum(axis=1)  # (n_mbon,)
+    pam_input = W_DAN_MBON[:, pam_indices].sum(axis=1)  # (n_mbon,)
+    total = ppl_input + pam_input
+
+    ppl_fractions = np.where(total > 0, ppl_input / total, 0.0)
+
+    if mode == 'hard':
+        sign_mask = np.zeros(n_mbon)
+        sign_mask[ppl_fractions > 0.5] = +1.0
+        sign_mask[ppl_fractions < 0.5] = -1.0
+        # MBONs with exactly 0.5 or no input remain 0
+    elif mode == 'continuous':
+        sign_mask = np.where(total > 0, 2.0 * ppl_fractions - 1.0, 0.0)
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}; use 'hard' or 'continuous'")
+
+    return sign_mask, ppl_fractions
+
+
+def print_mbon_sign_comparison(mbon_labels, manual_sign, derived_sign,
+                                ppl_fractions, mbon_groups):
+    """Print comparison table: connectivity-derived vs manual MBON classification."""
+    print("\n" + "=" * 80)
+    print("MBON VALENCE CLASSIFICATION: Connectivity-Derived vs Manual (Aso et al. 2014b)")
+    print("=" * 80)
+    print(f"{'MBON':<25s} {'Manual':>8s} {'Derived':>8s} {'PPL%':>6s} {'Match':>6s}")
+    print("-" * 80)
+
+    n_match = 0
+    n_classified = 0
+    for j, lbl in enumerate(mbon_labels):
+        m_sign = manual_sign[j]
+        d_sign = derived_sign[j]
+        ppl_pct = ppl_fractions[j] * 100
+
+        m_str = {1.0: '+1 app', -1.0: '-1 avd', 0.0: ' 0 oth'}[m_sign]
+        d_str = {1.0: '+1 app', -1.0: '-1 avd', 0.0: ' 0 oth'}.get(
+            d_sign, f'{d_sign:+.2f}')
+
+        if m_sign != 0:
+            n_classified += 1
+            match = (m_sign > 0 and d_sign > 0) or (m_sign < 0 and d_sign < 0)
+            if match:
+                n_match += 1
+            match_str = 'YES' if match else 'NO'
+        else:
+            match_str = '-'
+
+        print(f"{lbl:<25s} {m_str:>8s} {d_str:>8s} {ppl_pct:>5.1f}% {match_str:>6s}")
+
+    print("-" * 80)
+    print(f"Agreement on classified MBONs: {n_match}/{n_classified} "
+          f"({100*n_match/n_classified:.0f}%)" if n_classified > 0 else "No classified MBONs")
+    print(f"Derived:  {int((derived_sign > 0).sum())} approach, "
+          f"{int((derived_sign < 0).sum())} avoid, "
+          f"{int((derived_sign == 0).sum())} neutral")
+    print("=" * 80)
+
+
+def load_pam_indices(dan_ann_path, ids_path):
+    """Return row indices (into DAN weight matrices) of PAM neurons."""
+    dan_ann = pd.read_csv(dan_ann_path)
+    ids     = np.load(ids_path, allow_pickle=True)
+    dan_ids = ids['dan_ids']
+
+    pam_root_ids = set(
+        dan_ann.loc[dan_ann['cell_type'].str.startswith('PAM', na=False), 'root_id']
+    )
+    id2idx = {rid: i for i, rid in enumerate(dan_ids)}
+    pam_indices = [id2idx[rid] for rid in pam_root_ids if rid in id2idx]
+    return sorted(pam_indices)
+
+
 def build_ppl_stimulus(n_dan, ppl_indices, strength=80.0):
     """Build a per-DAN input vector that activates only PPL neurons."""
     x = np.zeros(n_dan)
     x[ppl_indices] = strength
+    return x
+
+
+def build_pam_stimulus(n_dan, pam_indices, strength=80.0):
+    """Build a per-DAN input vector that activates only PAM neurons."""
+    x = np.zeros(n_dan)
+    x[pam_indices] = strength
     return x
 
 
@@ -273,12 +394,13 @@ def run_v4():
 
     # -- Trial parameters (Gkanias et al. 2022 paradigm) ---------------------
     # Forward:  CS (2000 ms odor) with US overlapping the final 500 ms.
-    #           When DA arrives at t=us_on, KCs are already active → δ>0, k>0
-    #           → potentiation of CS-responsive KC→MBON synapses.
+    #           When DA arrives at t=us_on, KCs are already active → D_△ rises
+    #           fast, D_▽ rises slow → δ = D_▽ − D_△ < 0, k>0
+    #           → depression of CS-responsive KC→MBON synapses.
     # Backward: US (500 ms shock) first; CS begins 500 ms after US ends.
     #           When KCs activate, D_△ has decayed (τ=200ms, ~8% remaining at
     #           500ms post-US) but D_▽ still elevated (τ=2000ms, ~78% remaining)
-    #           → δ < 0 → depression of CS-responsive KC→MBON synapses.
+    #           → δ = D_▽ − D_△ > 0 → potentiation of CS-responsive KC→MBON synapses.
     n_trials       = 5
     trial_duration = 4000   # ms  (total per trial)
 

@@ -1,16 +1,16 @@
-"""V4g: Apple cider vinegar (ACV) odor experiment.
+"""V4g: Apple cider vinegar (ACV) odor experiment with connectivity-derived valence.
 
-Uses the original Gkanias et al. (2022) DPR with Bennett et al. (2021)
-KC-gating-only update and Huang et al. (2024) rate dynamics.  No manual
-sign switching or compartmental plasticity — the model runs the published
-rules as-is.
+Combines:
+  - Gkanias et al. (2022) DPR — two-timescale dopaminergic plasticity rule
+  - Bennett et al. (2021) MV model — compartmental valence-opponent DA signaling
+  - Huang et al. (2024) rate dynamics
+  - Connectivity-derived MBON valence from FlyWire DAN→MBON connectivity
 
 ACV glomerular activation from Semmelhack & Wang (2009) J Neurosci 29:15511:
   Normal concentration: DM1, DM4, DP1m, DM2, DM3, VM2, VA2  (7 glomeruli)
   High concentration:   + DM5                                 (8 glomeruli)
 
-Runs both concentrations and compares forward vs backward conditioning
-for each.  Produces 8 figures per concentration (16 total).
+Runs both concentrations with connectivity-derived compartmental plasticity.
 """
 
 import sys
@@ -27,7 +27,9 @@ from mbmodel.models import MushroomBodyNetwork
 from mbmodel.stimuli import create_odor_from_glomeruli
 
 from v4_conditioning import (
-    load_ppl_indices, load_mbon_labels, classify_mbons,
+    load_ppl_indices, load_pam_indices, load_mbon_labels, classify_mbons,
+    build_mbon_sign_mask, derive_mbon_sign_from_connectivity,
+    print_mbon_sign_comparison,
     train_trial, record_training_trial, test_trial,
 )
 
@@ -37,8 +39,8 @@ ACV_NORMAL_GLOM = ['DM1', 'DM2', 'DM3', 'DM4', 'DP1m', 'VA2', 'VM2']
 ACV_HIGH_GLOM   = ACV_NORMAL_GLOM + ['DM5']
 
 
-def make_network(config):
-    """Create and configure a MushroomBodyNetwork with standard Gkanias DPR."""
+def make_network(config, ppl_indices=None, pam_indices=None, sign_mask=None):
+    """Create and configure a MushroomBodyNetwork with compartmental plasticity."""
     net = MushroomBodyNetwork(config)
     w_rest = config.get('w_rest', 1.0)
     net.W_KC_DAN[:] = 0.0
@@ -49,11 +51,13 @@ def make_network(config):
     if wmax > 0:
         net.W_KC_MBON *= (w_rest / wmax)
     net.W_initial = net.W_KC_MBON.copy()
+    if sign_mask is not None:
+        net.set_compartmental_plasticity(ppl_indices, pam_indices, sign_mask)
     return net
 
 
-def run_condition(label, glomeruli, config, ppl_indices,
-                  mbon_groups, mbon_labels, prefix):
+def run_condition(label, glomeruli, config, ppl_indices, pam_indices,
+                  sign_mask, mbon_groups, mbon_labels, prefix):
     """Run forward + backward conditioning for one ACV concentration.
 
     Returns dict with all results and generates 8 figures.
@@ -63,10 +67,10 @@ def run_condition(label, glomeruli, config, ppl_indices,
     print(f"  Glomeruli: {', '.join(glomeruli)}")
     print(f"{'='*65}")
 
-    # -- Networks ------------------------------------------------------------
-    net_fwd   = make_network(config)
-    net_bwd   = make_network(config)
-    net_naive = make_network(config)
+    # -- Networks with compartmental plasticity --------------------------------
+    net_fwd   = make_network(config, ppl_indices, pam_indices, sign_mask)
+    net_bwd   = make_network(config, ppl_indices, pam_indices, sign_mask)
+    net_naive = make_network(config, ppl_indices, pam_indices, sign_mask)
 
     n_kc   = net_fwd.KCs.n
     n_mbon = net_fwd.MBONs.n
@@ -177,7 +181,7 @@ def run_condition(label, glomeruli, config, ppl_indices,
     # ================================================================
     # FIGURE 1 — Training vs Post-Training
     # ================================================================
-    net_viz = make_network(config)
+    net_viz = make_network(config, ppl_indices, pam_indices, sign_mask)
     n_steps = int(trial_duration / dt)
     record_every = 10
     n_rec = n_steps // record_every
@@ -439,8 +443,9 @@ def run_condition(label, glomeruli, config, ppl_indices,
 
 def run_v4g():
     print("=" * 65)
-    print("V4g: Apple Cider Vinegar — Gkanias DPR + Bennett KC-gating + Huang Dynamics")
-    print("  Semmelhack & Wang (2009) glomerular activation")
+    print("V4g: Apple Cider Vinegar — Connectivity-Derived Valence + Compartmental Plasticity")
+    print("    Gkanias DPR + Bennett MV + Huang Dynamics")
+    print("    Semmelhack & Wang (2009) glomerular activation")
     print("=" * 65)
 
     # -- Config --------------------------------------------------------------
@@ -455,22 +460,41 @@ def run_v4g():
     ids_path     = 'data/connectomes/processed/mb_circuit_right_ids.npz'
 
     ppl_indices = load_ppl_indices(dan_ann_path, ids_path)
+    pam_indices = load_pam_indices(dan_ann_path, ids_path)
     mbon_groups = classify_mbons()
     mbon_labels = load_mbon_labels(
         'data/connectomes/processed/mb_circuit_right_mbon_annotations.csv',
         ids_path,
     )
 
-    print(f"PPL: {len(ppl_indices)} DANs")
-    print(f"MBONs: {len(mbon_groups['approach'])} approach, "
+    print(f"PPL (aversive):   {len(ppl_indices)} DANs")
+    print(f"PAM (appetitive): {len(pam_indices)} DANs")
+    print(f"MBONs (manual): {len(mbon_groups['approach'])} approach, "
           f"{len(mbon_groups['avoid'])} avoid, "
           f"{len(mbon_groups['other'])} other")
 
-    # -- Run both concentrations ---------------------------------------------
+    # -- Derive MBON sign from connectivity ----------------------------------
+    probe = MushroomBodyNetwork(config)
+    n_mbon = probe.MBONs.n
+    manual_sign = build_mbon_sign_mask(n_mbon, mbon_groups)
+
+    hard_sign, hard_ppl_frac = derive_mbon_sign_from_connectivity(
+        probe.W_DAN_MBON, ppl_indices, pam_indices, mode='hard')
+
+    print(f"\nConnectivity-derived (hard): "
+          f"{int((hard_sign > 0).sum())} approach, "
+          f"{int((hard_sign < 0).sum())} avoid, "
+          f"{int((hard_sign == 0).sum())} neutral")
+
+    print_mbon_sign_comparison(mbon_labels, manual_sign, hard_sign,
+                                hard_ppl_frac, mbon_groups)
+
+    # -- Run both concentrations with connectivity-derived sign ----------------
     res_normal = run_condition(
         label='ACV (Normal Concentration)',
         glomeruli=ACV_NORMAL_GLOM,
-        config=config, ppl_indices=ppl_indices,
+        config=config, ppl_indices=ppl_indices, pam_indices=pam_indices,
+        sign_mask=hard_sign,
         mbon_groups=mbon_groups, mbon_labels=mbon_labels,
         prefix='v4g_acv_normal',
     )
@@ -478,7 +502,8 @@ def run_v4g():
     res_high = run_condition(
         label='ACV (High Concentration)',
         glomeruli=ACV_HIGH_GLOM,
-        config=config, ppl_indices=ppl_indices,
+        config=config, ppl_indices=ppl_indices, pam_indices=pam_indices,
+        sign_mask=hard_sign,
         mbon_groups=mbon_groups, mbon_labels=mbon_labels,
         prefix='v4g_acv_high',
     )
